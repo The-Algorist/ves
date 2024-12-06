@@ -3,6 +3,7 @@ package chunking
 import (
     "bytes"
     "crypto/rand"
+    "fmt"
     "io"
     "testing"
 )
@@ -257,5 +258,127 @@ func TestChunkReader_Statistics(t *testing.T) {
 
     if lastStats.CurrentProgress != 100 {
         t.Errorf("Final progress = %.2f, want 100", lastStats.CurrentProgress)
+    }
+}
+
+func TestChunkReader_Validation(t *testing.T) {
+    // Create test data
+    input := bytes.Repeat([]byte{1}, 256*1024) // 256KB
+    reader, err := NewChunkReader(bytes.NewReader(input), 64*1024) // 64KB chunks
+    if err != nil {
+        t.Fatalf("Failed to create chunk reader: %v", err)
+    }
+
+    // Read all chunks
+    buf := make([]byte, 64*1024)
+    var checksums []string
+    for {
+        n, err := reader.Read(buf)
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            t.Fatalf("Read failed: %v", err)
+        }
+
+        // Verify chunk info
+        chunkInfo := reader.GetChunkInfo()
+        if chunkInfo.Size != n {
+            t.Errorf("Chunk size mismatch: got %d, want %d", chunkInfo.Size, n)
+        }
+        if chunkInfo.Checksum == "" {
+            t.Error("Checksum should not be empty when validation is enabled")
+        }
+        checksums = append(checksums, chunkInfo.Checksum)
+    }
+
+    stats := reader.GetStats()
+    if len(stats.ValidChunks) != len(checksums) {
+        t.Errorf("ValidChunks count mismatch: got %d, want %d", 
+            len(stats.ValidChunks), len(checksums))
+    }
+}
+
+type errorReader struct {
+    data      []byte
+    position  int
+    failCount int
+    reads     int
+}
+
+func (r *errorReader) Read(p []byte) (n int, err error) {
+    r.reads++
+    
+    // Fail on the second Read call and keep failing
+    if r.reads > 1 {
+        r.failCount++
+        return 0, fmt.Errorf("simulated error (attempt %d)", r.failCount)
+    }
+    
+    if r.position >= len(r.data) {
+        return 0, io.EOF
+    }
+    
+    n = copy(p, r.data[r.position:])
+    r.position += n
+    return n, nil
+}
+
+func TestChunkReader_ErrorRecovery(t *testing.T) {
+    // Create test data for exactly 3 chunks
+    chunkSize := 1024 * 1024 // 1MB chunks
+    input := bytes.Repeat([]byte{1}, chunkSize*3) // 3MB total
+    
+    er := &errorReader{
+        data: input,
+    }
+    
+    reader, err := NewChunkReader(er, chunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create chunk reader: %v", err)
+    }
+
+    // Read all chunks
+    buf := make([]byte, chunkSize)
+    chunks := 0
+    
+    // First read should succeed
+    n, err := reader.Read(buf)
+    if err != nil {
+        t.Fatalf("First read failed: %v", err)
+    }
+    if n != chunkSize {
+        t.Fatalf("Expected to read %d bytes, got %d", chunkSize, n)
+    }
+    chunks++
+
+    // Second read should fail after retries
+    _, err = reader.Read(buf)
+    if err == nil {
+        t.Fatal("Expected error on second read")
+    }
+    
+    chunkErr, ok := err.(*ChunkError)
+    if !ok {
+        t.Fatalf("Expected ChunkError, got %T: %v", err, err)
+    }
+    
+    // Verify error details
+    if chunkErr.RetryCount != MaxRetries {
+        t.Errorf("Expected %d retries in error, got %d", MaxRetries, chunkErr.RetryCount)
+    }
+    if chunkErr.ChunkNumber != 2 {
+        t.Errorf("Expected error on chunk 2, got chunk %d", chunkErr.ChunkNumber)
+    }
+
+    stats := reader.GetStats()
+    if stats.Retries != MaxRetries {
+        t.Errorf("Expected %d retries, got %d", MaxRetries, stats.Retries)
+    }
+    if len(stats.FailedChunks) != 1 {
+        t.Errorf("Expected 1 failed chunk, got %d", len(stats.FailedChunks))
+    }
+    if chunks != 1 {
+        t.Errorf("Expected to read 1 chunk successfully before error, got %d", chunks)
     }
 }

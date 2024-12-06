@@ -1,6 +1,8 @@
 package chunking
 
 import (
+    "crypto/sha256"
+    "encoding/hex"
     "fmt"
     "io"
     "time"
@@ -11,24 +13,52 @@ const (
     DefaultChunkSize = 1024 * 1024    // 1MB default chunk size
     MinChunkSize    = 64 * 1024       // 64KB minimum chunk size
     MaxChunkSize    = 8 * 1024 * 1024 // 8MB maximum chunk size
+    MaxRetries      = 3               // Maximum number of retry attempts
 )
+
+// ChunkError represents an error that occurred during chunk processing
+type ChunkError struct {
+    ChunkNumber int64
+    Offset      int64
+    Err         error
+    RetryCount  int
+}
+
+func (e *ChunkError) Error() string {
+    return fmt.Sprintf("chunk %d at offset %d failed: %v (retries: %d)", 
+        e.ChunkNumber, e.Offset, e.Err, e.RetryCount)
+}
+
+// ChunkInfo contains validation information for a chunk
+type ChunkInfo struct {
+    Number   int64
+    Size     int
+    Checksum string
+    Offset   int64
+}
 
 // Stats holds statistics about the chunk reading process
 type Stats struct {
-    BytesRead       int64         // Total bytes read
-    ChunksProcessed int64         // Number of chunks processed
-    StartTime       time.Time     // When the reading started
-    Duration        time.Duration // Total processing time
-    AverageChunkSize float64      // Average size of chunks
-    CurrentProgress  float64      // Progress percentage (0-100)
+    BytesRead        int64
+    ChunksProcessed  int64
+    StartTime        time.Time
+    Duration         time.Duration
+    AverageChunkSize float64
+    CurrentProgress  float64
+    Retries         int           // Number of retries performed
+    FailedChunks    []ChunkInfo  // Information about failed chunks
+    ValidChunks     []ChunkInfo  // Information about successful chunks
 }
 
 type ChunkReader struct {
     reader          io.Reader
     chunkSize       int
-    totalSize       int64  // Total size of input (if known)
+    totalSize       int64
     stats           Stats
-    progressUpdated func(Stats) // Callback for progress updates
+    progressUpdated func(Stats)
+    currentChunk    ChunkInfo
+    validateChunks  bool         // Enable/disable chunk validation
+    retryEnabled    bool         // Enable/disable retry mechanism
 }
 
 // NewChunkReader creates a new ChunkReader with the given chunk size
@@ -44,27 +74,97 @@ func NewChunkReader(reader io.Reader, chunkSize int) (*ChunkReader, error) {
     }
 
     return &ChunkReader{
-        reader:    reader,
-        chunkSize: chunkSize,
-        totalSize: totalSize,
+        reader:         reader,
+        chunkSize:     chunkSize,
+        totalSize:     totalSize,
+        validateChunks: true,  // Enable validation by default
+        retryEnabled:   true,  // Enable retries by default
         stats: Stats{
             StartTime: time.Now(),
         },
     }, nil
 }
 
-// Read implements io.Reader and updates statistics
+// calculateChecksum generates a SHA-256 checksum for a chunk
+func calculateChecksum(data []byte) string {
+    hash := sha256.Sum256(data)
+    return hex.EncodeToString(hash[:])
+}
+
 func (r *ChunkReader) Read(p []byte) (n int, err error) {
     if len(p) > r.chunkSize {
         p = p[:r.chunkSize]
     }
 
-    n, err = r.reader.Read(p)
+    // Initialize chunk info
+    r.currentChunk = ChunkInfo{
+        Number: r.stats.ChunksProcessed + 1,
+        Offset: r.stats.BytesRead,
+    }
+
+    // Try reading with retries
+    var lastErr error
+    retryCount := 0
+    
+    for retryCount < MaxRetries {
+        n, err = r.reader.Read(p)
+        
+        if err == nil || err == io.EOF {
+            // Successful read or EOF
+            break
+        }
+        
+        // Record retry attempt and continue
+        lastErr = err
+        r.stats.Retries++
+        retryCount++
+        fmt.Printf("Retry %d: %v\n", retryCount, err)
+        
+        // Don't break, keep retrying until MaxRetries
+        continue
+    }
+
+    // Try one final time after all retries
+    if lastErr != nil {
+        n, err = r.reader.Read(p)
+        if err != nil {
+            chunkErr := &ChunkError{
+                ChunkNumber: r.currentChunk.Number,
+                Offset:     r.currentChunk.Offset,
+                Err:        err,
+                RetryCount: retryCount,
+            }
+            r.stats.FailedChunks = append(r.stats.FailedChunks, r.currentChunk)
+            return 0, chunkErr
+        }
+    }
+
     if n > 0 {
+        // Update chunk info
+        r.currentChunk.Size = n
+        if r.validateChunks {
+            r.currentChunk.Checksum = calculateChecksum(p[:n])
+        }
+        r.stats.ValidChunks = append(r.stats.ValidChunks, r.currentChunk)
         r.updateStats(n)
     }
 
     return n, err
+}
+
+// EnableValidation turns chunk validation on/off
+func (r *ChunkReader) EnableValidation(enable bool) {
+    r.validateChunks = enable
+}
+
+// EnableRetries turns retry mechanism on/off
+func (r *ChunkReader) EnableRetries(enable bool) {
+    r.retryEnabled = enable
+}
+
+// GetChunkInfo returns information about the current chunk
+func (r *ChunkReader) GetChunkInfo() ChunkInfo {
+    return r.currentChunk
 }
 
 // updateStats updates reading statistics
