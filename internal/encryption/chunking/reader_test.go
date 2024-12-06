@@ -197,3 +197,65 @@ func TestChunkReader_SetOperations(t *testing.T) {
         t.Errorf("Read after changes failed: got %d bytes, error: %v", n, err)
     }
 }
+
+func TestChunkReader_Statistics(t *testing.T) {
+    // Create a 1MB test file
+    input := bytes.Repeat([]byte{1}, 1024*1024)
+    chunkSize := 64 * 1024 // 64KB chunks
+
+    reader, err := NewChunkReader(bytes.NewReader(input), chunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create chunk reader: %v", err)
+    }
+
+    // Add progress callback
+    var lastStats Stats
+    progressCalled := false
+    reader.SetProgressCallback(func(stats Stats) {
+        progressCalled = true
+        lastStats = stats
+    })
+
+    // Read all data
+    buf := make([]byte, chunkSize)
+    totalRead := 0
+    for {
+        n, err := reader.Read(buf)
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            t.Fatalf("Read failed: %v", err)
+        }
+        totalRead += n
+    }
+
+    // Get final stats
+    stats := reader.GetStats()
+
+    // Verify statistics
+    if stats.BytesRead != int64(len(input)) {
+        t.Errorf("BytesRead = %d, want %d", stats.BytesRead, len(input))
+    }
+
+    expectedChunks := (len(input) + chunkSize - 1) / chunkSize
+    if stats.ChunksProcessed != int64(expectedChunks) {
+        t.Errorf("ChunksProcessed = %d, want %d", stats.ChunksProcessed, expectedChunks)
+    }
+
+    if stats.Duration <= 0 {
+        t.Error("Duration should be positive")
+    }
+
+    if stats.AverageChunkSize <= 0 {
+        t.Error("AverageChunkSize should be positive")
+    }
+
+    if !progressCalled {
+        t.Error("Progress callback was not called")
+    }
+
+    if lastStats.CurrentProgress != 100 {
+        t.Errorf("Final progress = %.2f, want 100", lastStats.CurrentProgress)
+    }
+}
