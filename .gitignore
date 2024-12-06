@@ -1,0 +1,14 @@
+videos/*
+
+*.key
+*.iv    
+node_modules/*
+
+*.mp4
+*.mp3
+*.wav
+
+*.enc
+*.key
+*.iv
+coverage.out
