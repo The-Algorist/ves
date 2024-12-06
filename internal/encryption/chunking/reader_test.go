@@ -382,3 +382,106 @@ func TestChunkReader_ErrorRecovery(t *testing.T) {
         t.Errorf("Expected to read 1 chunk successfully before error, got %d", chunks)
     }
 }
+
+func TestChunkReader_ParallelProcessing(t *testing.T) {
+    // Create test data - 10MB total, using 1MB chunks
+    dataSize := 10 * 1024 * 1024
+    chunkSize := 1024 * 1024
+    input := bytes.Repeat([]byte{1}, dataSize)
+    
+    reader, err := NewChunkReader(bytes.NewReader(input), chunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create chunk reader: %v", err)
+    }
+
+    // Test enabling concurrency
+    err = reader.EnableConcurrency(true, DefaultWorkers)
+    if err != nil {
+        t.Fatalf("Failed to enable concurrency: %v", err)
+    }
+
+    // Read all chunks
+    buf := make([]byte, chunkSize)
+    expectedChunks := dataSize / chunkSize
+    processedChunks := 0
+
+    for {
+        n, err := reader.Read(buf)
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            t.Fatalf("Read failed: %v", err)
+        }
+        if n != chunkSize && processedChunks < expectedChunks-1 {
+            t.Errorf("Expected chunk size %d, got %d", chunkSize, n)
+        }
+        processedChunks++
+    }
+
+    // Verify results
+    stats := reader.GetStats()
+    
+    if stats.ChunksProcessed != int64(expectedChunks) {
+        t.Errorf("Expected %d chunks processed, got %d", 
+            expectedChunks, stats.ChunksProcessed)
+    }
+
+    if len(stats.WorkerStats) != DefaultWorkers {
+        t.Errorf("Expected %d worker stats, got %d", 
+            DefaultWorkers, len(stats.WorkerStats))
+    }
+
+    // Test worker utilization
+    totalProcessed := int64(0)
+    for _, ws := range stats.WorkerStats {
+        if ws.ChunksProcessed <= 0 {
+            t.Errorf("Worker %d processed no chunks", ws.WorkerID)
+        }
+        totalProcessed += ws.ChunksProcessed
+    }
+
+    if totalProcessed != int64(expectedChunks) {
+        t.Errorf("Total chunks processed by workers (%d) doesn't match expected (%d)",
+            totalProcessed, expectedChunks)
+    }
+}
+
+func TestChunkReader_ConcurrencyControl(t *testing.T) {
+    reader, err := NewChunkReader(bytes.NewReader([]byte{1}), DefaultChunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create chunk reader: %v", err)
+    }
+
+    // Test invalid worker counts
+    tests := []struct {
+        name       string
+        numWorkers int
+        wantErr    bool
+    }{
+        {"Zero workers", 0, true},
+        {"Negative workers", -1, true},
+        {"Too many workers", MaxWorkers + 1, true},
+        {"Minimum workers", MinWorkers, false},
+        {"Maximum workers", MaxWorkers, false},
+        {"Default workers", DefaultWorkers, false},
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            err := reader.EnableConcurrency(true, tt.numWorkers)
+            if (err != nil) != tt.wantErr {
+                t.Errorf("EnableConcurrency() error = %v, wantErr %v", err, tt.wantErr)
+            }
+        })
+    }
+
+    // Test disabling concurrency
+    err = reader.EnableConcurrency(false, DefaultWorkers)
+    if err != nil {
+        t.Errorf("Failed to disable concurrency: %v", err)
+    }
+    if reader.concurrency {
+        t.Error("Concurrency still enabled after disabling")
+    }
+}
