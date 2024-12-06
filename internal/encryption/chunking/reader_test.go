@@ -5,7 +5,9 @@ import (
     "crypto/rand"
     "fmt"
     "io"
+    "os"
     "testing"
+    "time"
 )
 
 func generateVideoData(size int) []byte {
@@ -483,5 +485,263 @@ func TestChunkReader_ConcurrencyControl(t *testing.T) {
     }
     if reader.concurrency {
         t.Error("Concurrency still enabled after disabling")
+    }
+}
+
+// mockMemoryReader simulates high memory usage to trigger adaptations
+type mockMemoryReader struct {
+    *bytes.Reader
+    memoryUsage float64
+    readCount   int
+}
+
+func (m *mockMemoryReader) Read(p []byte) (n int, err error) {
+    m.readCount++
+    // Simulate memory usage pattern: increase -> spike -> decrease
+    switch {
+    case m.readCount < 5:
+        m.memoryUsage += 10.0 // Gradual increase
+    case m.readCount == 5:
+        m.memoryUsage = MemoryThresholdHigh + 5 // Spike
+    case m.readCount < 10:
+        m.memoryUsage = MemoryThresholdLow - 5 // Drop to low
+    default:
+        m.memoryUsage += 5.0 // Start increasing again
+    }
+    return m.Reader.Read(p)
+}
+
+func (m *mockMemoryReader) GetMemoryUsage() float64 {
+    return m.memoryUsage
+}
+
+func TestChunkReader_AdaptiveSizing(t *testing.T) {
+    // Create a large test file to trigger memory adaptations
+    dataSize := 20 * 1024 * 1024 // 20MB
+    input := generateVideoData(dataSize)
+    initialChunkSize := 1024 * 1024 // 1MB
+
+    // Use mock reader that simulates increasing memory usage
+    mockReader := &mockMemoryReader{
+        Reader: bytes.NewReader(input),
+        memoryUsage: 50.0, // Start at 50% memory usage
+    }
+
+    reader, err := NewChunkReader(mockReader, initialChunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create chunk reader: %v", err)
+    }
+
+    // Enable adaptive sizing and set shorter check interval for testing
+    reader.EnableAdaptiveSizing(true)
+    reader.SetMemoryCheckInterval(50 * time.Millisecond)
+
+    // Read chunks and monitor size adaptations
+    buf := make([]byte, MaxChunkSize) // Use max size buffer to accommodate any adaptation
+    chunkSizes := make([]int, 0)
+    lastSize := initialChunkSize
+    totalBytesRead := 0
+
+    // Force initial memory stats collection
+    reader.systemStats.LastCheck = time.Now().Add(-2 * reader.memCheckInterval)
+
+    for {
+        n, err := reader.Read(buf)
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            t.Fatalf("Read failed: %v", err)
+        }
+        totalBytesRead += n
+
+        currentSize := reader.chunkSize
+        if currentSize != lastSize {
+            // Store the size change
+            chunkSizes = append(chunkSizes, currentSize)
+            lastSize = currentSize
+
+            // Verify size change is within adaptation rates
+            sizeRatio := float64(currentSize) / float64(lastSize)
+            if sizeRatio > ChunkSizeIncreaseRate || sizeRatio < ChunkSizeDecreaseRate {
+                t.Errorf("Chunk size change ratio %.2f outside allowed range [%.2f, %.2f]",
+                    sizeRatio, ChunkSizeDecreaseRate, ChunkSizeIncreaseRate)
+            }
+        }
+
+        // Verify chunk size bounds
+        if currentSize < MinChunkSize || currentSize > MaxChunkSize {
+            t.Errorf("Chunk size out of bounds: got %d, want between %d and %d",
+                currentSize, MinChunkSize, MaxChunkSize)
+        }
+
+        // Add small delay to allow memory stats to update
+        time.Sleep(5 * time.Millisecond)
+    }
+
+    // Verify total bytes read
+    if totalBytesRead != dataSize {
+        t.Errorf("Total bytes read = %d, want %d", totalBytesRead, dataSize)
+    }
+
+    // Verify that memory stats were collected
+    if reader.systemStats.MemoryUsage == 0 {
+        t.Error("Memory usage stats not collected")
+    }
+
+    if reader.systemStats.AvgProcessingTime == 0 {
+        t.Error("Processing time stats not collected")
+    }
+
+    // Verify that chunk sizes were actually adapted
+    if len(chunkSizes) == 0 {
+        t.Error("No chunk size adaptations occurred during test")
+    } else {
+        t.Logf("Memory usage pattern: %v", mockReader.memoryUsage)
+        t.Logf("Chunk size adaptations: initial=%d, changes=%v", initialChunkSize, chunkSizes)
+    }
+}
+
+func TestChunkReader_StateManagement(t *testing.T) {
+    // Create test data
+    dataSize := 5 * 1024 * 1024 // 5MB
+    chunkSize := 1024 * 1024    // 1MB chunks
+    input := generateVideoData(dataSize)
+    checkpointFile := "test_checkpoint.json"
+
+    // Clean up checkpoint file after test
+    defer os.Remove(checkpointFile)
+
+    reader, err := NewChunkReader(bytes.NewReader(input), chunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create chunk reader: %v", err)
+    }
+
+    // Enable resume capability
+    reader.EnableResume(true, checkpointFile)
+
+    // Read half the chunks
+    buf := make([]byte, chunkSize)
+    chunksToRead := dataSize / (2 * chunkSize)
+    for i := 0; i < chunksToRead; i++ {
+        n, err := reader.Read(buf)
+        if err != nil {
+            t.Fatalf("Read failed: %v", err)
+        }
+        if n != chunkSize {
+            t.Errorf("Expected chunk size %d, got %d", chunkSize, n)
+        }
+    }
+
+    // Verify checkpoint was saved
+    if err := reader.SaveCheckpoint(); err != nil {
+        t.Fatalf("Failed to save checkpoint: %v", err)
+    }
+
+    // Create new reader and load checkpoint
+    newReader, err := NewChunkReader(bytes.NewReader(input), chunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create new reader: %v", err)
+    }
+
+    newReader.EnableResume(true, checkpointFile)
+    if err := newReader.LoadCheckpoint(); err != nil {
+        t.Fatalf("Failed to load checkpoint: %v", err)
+    }
+
+    // Verify restored state
+    if newReader.stats.ChunksProcessed != int64(chunksToRead) {
+        t.Errorf("Restored chunks processed = %d, want %d",
+            newReader.stats.ChunksProcessed, chunksToRead)
+    }
+
+    // Verify chunk states
+    state := newReader.GetProcessingState()
+    for i := int64(1); i <= int64(chunksToRead); i++ {
+        if state[i] != ChunkStateCompleted {
+            t.Errorf("Chunk %d state = %v, want %v", i, state[i], ChunkStateCompleted)
+        }
+    }
+
+    // Continue reading remaining chunks
+    remainingChunks := (dataSize/chunkSize) - chunksToRead
+    for i := 0; i < remainingChunks; i++ {
+        n, err := newReader.Read(buf)
+        if err != nil && err != io.EOF {
+            t.Fatalf("Read failed: %v", err)
+        }
+        if err != io.EOF && n != chunkSize {
+            t.Errorf("Expected chunk size %d, got %d", chunkSize, n)
+        }
+    }
+
+    // Verify final state
+    finalStats := newReader.GetStats()
+    expectedTotalChunks := dataSize / chunkSize
+    if finalStats.ChunksProcessed != int64(expectedTotalChunks) {
+        t.Errorf("Final chunks processed = %d, want %d",
+            finalStats.ChunksProcessed, expectedTotalChunks)
+    }
+}
+
+func TestChunkReader_CheckpointRecovery(t *testing.T) {
+    // Test recovery from invalid/corrupted checkpoint file
+    reader, err := NewChunkReader(bytes.NewReader([]byte{1}), DefaultChunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create reader: %v", err)
+    }
+
+    // Test with non-existent file
+    reader.EnableResume(true, "nonexistent.json")
+    if err := reader.LoadCheckpoint(); err != nil {
+        t.Errorf("Loading non-existent checkpoint should not error: %v", err)
+    }
+
+    // Test with invalid JSON
+    invalidFile := "invalid_checkpoint.json"
+    if err := os.WriteFile(invalidFile, []byte("invalid json"), 0644); err != nil {
+        t.Fatalf("Failed to create invalid checkpoint file: %v", err)
+    }
+    defer os.Remove(invalidFile)
+
+    reader.EnableResume(true, invalidFile)
+    err = reader.LoadCheckpoint()
+    if err == nil {
+        t.Error("Expected error loading invalid checkpoint file")
+    }
+
+    // Test with invalid seek position
+    checkpointFile := "test_checkpoint.json"
+    defer os.Remove(checkpointFile)
+
+    // Create a reader with some data
+    dataSize := 1024 * 1024 // 1MB
+    input := generateVideoData(dataSize)
+    reader, err = NewChunkReader(bytes.NewReader(input), DefaultChunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create reader: %v", err)
+    }
+
+    reader.EnableResume(true, checkpointFile)
+    reader.stats.BytesRead = int64(dataSize * 2) // Set position beyond file size
+    
+    // Save checkpoint with invalid position
+    err = reader.SaveCheckpoint()
+    if err != nil {
+        t.Fatalf("Failed to save checkpoint: %v", err)
+    }
+
+    // Try to load checkpoint with invalid position
+    newReader, err := NewChunkReader(bytes.NewReader(input), DefaultChunkSize)
+    if err != nil {
+        t.Fatalf("Failed to create new reader: %v", err)
+    }
+    newReader.EnableResume(true, checkpointFile)
+    
+    err = newReader.LoadCheckpoint()
+    if err == nil {
+        t.Error("Expected error loading checkpoint with invalid seek position")
+    } else {
+        t.Logf("Got expected error: %v", err)
     }
 }

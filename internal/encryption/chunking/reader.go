@@ -3,8 +3,11 @@ package chunking
 import (
     "crypto/sha256"
     "encoding/hex"
+    "encoding/json"
     "fmt"
     "io"
+    "os"
+    "runtime"
     "sync"
     "time"
 )
@@ -19,6 +22,13 @@ const (
     MaxWorkers     = 16             // Maximum allowed workers
     MinWorkers     = 1              // Minimum allowed workers
     QueueSize      = 100            // Size of the chunk processing queue
+    
+    // Memory thresholds for adaptive sizing
+    MemoryThresholdHigh = 85  // High memory usage threshold (percentage)
+    MemoryThresholdLow  = 60  // Low memory usage threshold (percentage)
+    ChunkSizeDecreaseRate = 0.75  // Decrease chunk size by 25% when memory is high
+    ChunkSizeIncreaseRate = 1.25  // Increase chunk size by 25% when memory is low
+    MemoryCheckInterval   = 5 * time.Second  // How often to check memory usage
 )
 
 // ChunkError represents an error that occurred during chunk processing
@@ -54,6 +64,13 @@ type Stats struct {
     FailedChunks    []ChunkInfo  // Information about failed chunks
     ValidChunks     []ChunkInfo  // Information about successful chunks
     WorkerStats     []WorkerStats  // Statistics for each worker
+}
+
+// SystemStats holds system resource information
+type SystemStats struct {
+    MemoryUsage     float64   // Current memory usage percentage
+    LastCheck       time.Time // Last time memory was checked
+    AvgProcessingTime time.Duration // Average time to process a chunk
 }
 
 // ChunkProcessor represents a chunk processing worker
@@ -154,6 +171,27 @@ func (w *ChunkProcessor) start() {
     }
 }
 
+// ChunkState represents the processing state of a chunk
+type ChunkState int
+
+const (
+    ChunkStatePending ChunkState = iota
+    ChunkStateProcessing
+    ChunkStateCompleted
+    ChunkStateFailed
+)
+
+// Checkpoint represents a saved state of the chunk processing
+type Checkpoint struct {
+    Position         int64
+    ProcessedChunks  []ChunkInfo
+    LastChunkState   ChunkState
+    Stats           Stats
+    SystemStats     SystemStats
+    Timestamp       time.Time
+}
+
+// ChunkReader struct update
 type ChunkReader struct {
     reader          io.Reader
     chunkSize       int
@@ -161,19 +199,26 @@ type ChunkReader struct {
     stats           Stats
     progressUpdated func(Stats)
     currentChunk    ChunkInfo
-    validateChunks  bool         // Enable/disable chunk validation
-    retryEnabled    bool         // Enable/disable retry mechanism
-    workerPool  *WorkerPool
-    concurrency bool
+    validateChunks  bool
+    retryEnabled    bool
+    workerPool      *WorkerPool
+    concurrency     bool
+    systemStats     SystemStats
+    adaptiveSizing  bool
+    lastSizeChange  time.Time
+    checkpointFile  string
+    resumeEnabled   bool
+    processedChunks map[int64]ChunkState
+    lastCheckpoint  *Checkpoint
+    memCheckInterval time.Duration  // Add configurable interval
 }
 
-// NewChunkReader creates a new ChunkReader with the given chunk size
+// NewChunkReader update
 func NewChunkReader(reader io.Reader, chunkSize int) (*ChunkReader, error) {
     if chunkSize < MinChunkSize || chunkSize > MaxChunkSize {
         return nil, fmt.Errorf("invalid chunk size: must be between %d and %d bytes", MinChunkSize, MaxChunkSize)
     }
 
-    // Try to get total size if reader supports it
     var totalSize int64
     if sizer, ok := reader.(interface{ Size() int64 }); ok {
         totalSize = sizer.Size()
@@ -183,12 +228,115 @@ func NewChunkReader(reader io.Reader, chunkSize int) (*ChunkReader, error) {
         reader:         reader,
         chunkSize:     chunkSize,
         totalSize:     totalSize,
-        validateChunks: true,  // Enable validation by default
-        retryEnabled:   true,  // Enable retries by default
+        validateChunks: true,
+        retryEnabled:   true,
+        adaptiveSizing: false,
+        resumeEnabled:  false,
+        processedChunks: make(map[int64]ChunkState),
+        memCheckInterval: MemoryCheckInterval, // Use constant as default
         stats: Stats{
             StartTime: time.Now(),
         },
+        systemStats: SystemStats{
+            LastCheck: time.Now(),
+        },
     }, nil
+}
+
+// EnableResume enables or disables resume capabilities
+func (r *ChunkReader) EnableResume(enable bool, checkpointFile string) {
+    r.resumeEnabled = enable
+    r.checkpointFile = checkpointFile
+    if enable && r.lastCheckpoint == nil {
+        r.lastCheckpoint = &Checkpoint{
+            Timestamp: time.Now(),
+        }
+    }
+}
+
+// SaveCheckpoint saves the current processing state
+func (r *ChunkReader) SaveCheckpoint() error {
+    if !r.resumeEnabled {
+        return nil
+    }
+
+    checkpoint := &Checkpoint{
+        Position:        r.stats.BytesRead,
+        ProcessedChunks: r.stats.ValidChunks,
+        LastChunkState:  r.processedChunks[r.currentChunk.Number],
+        Stats:          r.stats,
+        SystemStats:    r.systemStats,
+        Timestamp:      time.Now(),
+    }
+
+    // Save checkpoint to file
+    data, err := json.Marshal(checkpoint)
+    if err != nil {
+        return fmt.Errorf("failed to marshal checkpoint: %w", err)
+    }
+
+    if err := os.WriteFile(r.checkpointFile, data, 0644); err != nil {
+        return fmt.Errorf("failed to write checkpoint file: %w", err)
+    }
+
+    r.lastCheckpoint = checkpoint
+    return nil
+}
+
+// LoadCheckpoint loads the last saved processing state
+func (r *ChunkReader) LoadCheckpoint() error {
+    if !r.resumeEnabled {
+        return nil
+    }
+
+    data, err := os.ReadFile(r.checkpointFile)
+    if err != nil {
+        if os.IsNotExist(err) {
+            return nil // No checkpoint file exists
+        }
+        return fmt.Errorf("failed to read checkpoint file: %w", err)
+    }
+
+    checkpoint := &Checkpoint{}
+    if err := json.Unmarshal(data, checkpoint); err != nil {
+        return fmt.Errorf("failed to unmarshal checkpoint: %w", err)
+    }
+
+    // Verify checkpoint position is valid
+    if seeker, ok := r.reader.(io.Seeker); ok {
+        // Try to seek to verify position is valid
+        _, err := seeker.Seek(0, io.SeekEnd)
+        if err != nil {
+            return fmt.Errorf("failed to seek to end: %w", err)
+        }
+        
+        size, err := seeker.Seek(0, io.SeekCurrent)
+        if err != nil {
+            return fmt.Errorf("failed to get file size: %w", err)
+        }
+        
+        if checkpoint.Position > size {
+            return fmt.Errorf("invalid checkpoint position %d: exceeds file size %d", 
+                checkpoint.Position, size)
+        }
+
+        // Seek back to checkpoint position
+        if _, err := seeker.Seek(checkpoint.Position, io.SeekStart); err != nil {
+            return fmt.Errorf("failed to seek to checkpoint position: %w", err)
+        }
+    }
+
+    // Restore state from checkpoint
+    r.stats = checkpoint.Stats
+    r.systemStats = checkpoint.SystemStats
+    r.lastCheckpoint = checkpoint
+
+    // Restore processed chunks state
+    for _, chunk := range checkpoint.ProcessedChunks {
+        r.processedChunks[chunk.Number] = ChunkStateCompleted
+    }
+
+    return nil
 }
 
 // calculateChecksum generates a SHA-256 checksum for a chunk
@@ -197,7 +345,15 @@ func calculateChecksum(data []byte) string {
     return hex.EncodeToString(hash[:])
 }
 
+// Read method update
 func (r *ChunkReader) Read(p []byte) (n int, err error) {
+    // Check and adjust chunk size if adaptive sizing is enabled
+    if r.adaptiveSizing {
+        if err := r.adjustChunkSize(); err != nil {
+            fmt.Printf("Warning: Failed to adjust chunk size: %v\n", err)
+        }
+    }
+
     if len(p) > r.chunkSize {
         p = p[:r.chunkSize]
     }
@@ -207,6 +363,21 @@ func (r *ChunkReader) Read(p []byte) (n int, err error) {
         Number: r.stats.ChunksProcessed + 1,
         Offset: r.stats.BytesRead,
     }
+
+    // Check if chunk was already processed
+    if state, exists := r.processedChunks[r.currentChunk.Number]; exists && state == ChunkStateCompleted {
+        // Skip already processed chunk
+        if seeker, ok := r.reader.(io.Seeker); ok {
+            _, err := seeker.Seek(int64(r.chunkSize), io.SeekCurrent)
+            if err != nil {
+                return 0, fmt.Errorf("failed to seek past processed chunk: %w", err)
+            }
+            return r.chunkSize, nil
+        }
+    }
+
+    // Update chunk state
+    r.processedChunks[r.currentChunk.Number] = ChunkStateProcessing
 
     // Read the chunk
     n, err = r.reader.Read(p)
@@ -279,6 +450,16 @@ func (r *ChunkReader) Read(p []byte) (n int, err error) {
 
         r.stats.ValidChunks = append(r.stats.ValidChunks, r.currentChunk)
         r.updateStats(n)
+
+        // Update chunk state after successful processing
+        r.processedChunks[r.currentChunk.Number] = ChunkStateCompleted
+        
+        // Save checkpoint periodically
+        if r.resumeEnabled && r.stats.ChunksProcessed%10 == 0 {
+            if err := r.SaveCheckpoint(); err != nil {
+                fmt.Printf("Warning: Failed to save checkpoint: %v\n", err)
+            }
+        }
     }
 
     return n, err
@@ -305,6 +486,11 @@ func (r *ChunkReader) updateStats(bytesRead int) {
     r.stats.ChunksProcessed++
     r.stats.Duration = time.Since(r.stats.StartTime)
     r.stats.AverageChunkSize = float64(r.stats.BytesRead) / float64(r.stats.ChunksProcessed)
+
+    // Update system stats
+    if r.adaptiveSizing {
+        r.systemStats.AvgProcessingTime = r.stats.Duration / time.Duration(r.stats.ChunksProcessed)
+    }
 
     if r.totalSize > 0 {
         r.stats.CurrentProgress = float64(r.stats.BytesRead) / float64(r.totalSize) * 100
@@ -369,4 +555,93 @@ func (r *ChunkReader) processChunk(chunk *Chunk) (*ProcessedChunk, error) {
     }
     
     return processed, nil
+}
+
+// EnableAdaptiveSizing enables or disables adaptive chunk sizing
+func (r *ChunkReader) EnableAdaptiveSizing(enable bool) {
+    r.adaptiveSizing = enable
+    r.lastSizeChange = time.Now()
+}
+
+// MemoryReader interface for readers that can report memory usage
+type MemoryReader interface {
+    io.Reader
+    GetMemoryUsage() float64
+}
+
+// getSystemMemoryUsage returns the current system memory usage percentage
+func (r *ChunkReader) getSystemMemoryUsage() (float64, error) {
+    // If we have a reader that reports memory usage, use that
+    if mr, ok := r.reader.(MemoryReader); ok {
+        return mr.GetMemoryUsage(), nil
+    }
+    
+    // Otherwise use real memory stats
+    var m runtime.MemStats
+    runtime.ReadMemStats(&m)
+    memoryUsage := float64(m.Alloc) / float64(m.Sys) * 100
+    return memoryUsage, nil
+}
+
+// adjustChunkSize dynamically adjusts the chunk size based on system memory usage
+func (r *ChunkReader) adjustChunkSize() error {
+    // Only check periodically
+    if time.Since(r.systemStats.LastCheck) < r.memCheckInterval {
+        return nil
+    }
+
+    memUsage, err := r.getSystemMemoryUsage()
+    if err != nil {
+        return fmt.Errorf("failed to get memory usage: %w", err)
+    }
+
+    r.systemStats.MemoryUsage = memUsage
+    r.systemStats.LastCheck = time.Now()
+
+    // Only adjust if enough time has passed since last change
+    if time.Since(r.lastSizeChange) < r.memCheckInterval*2 {
+        return nil
+    }
+
+    currentSize := r.chunkSize
+    newSize := currentSize
+
+    switch {
+    case memUsage >= MemoryThresholdHigh:
+        // Decrease chunk size
+        newSize = int(float64(currentSize) * ChunkSizeDecreaseRate)
+    case memUsage <= MemoryThresholdLow:
+        // Increase chunk size
+        newSize = int(float64(currentSize) * ChunkSizeIncreaseRate)
+    }
+
+    // Ensure new size is within bounds
+    if newSize < MinChunkSize {
+        newSize = MinChunkSize
+    } else if newSize > MaxChunkSize {
+        newSize = MaxChunkSize
+    }
+
+    // Only update if size actually changed
+    if newSize != currentSize {
+        r.chunkSize = newSize
+        r.lastSizeChange = time.Now()
+    }
+
+    return nil
+}
+
+// GetProcessingState returns the current processing state
+func (r *ChunkReader) GetProcessingState() map[int64]ChunkState {
+    return r.processedChunks
+}
+
+// GetLastCheckpoint returns the last saved checkpoint
+func (r *ChunkReader) GetLastCheckpoint() *Checkpoint {
+    return r.lastCheckpoint
+}
+
+// SetMemoryCheckInterval allows configuring the memory check interval
+func (r *ChunkReader) SetMemoryCheckInterval(interval time.Duration) {
+    r.memCheckInterval = interval
 }
