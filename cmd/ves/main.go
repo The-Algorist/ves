@@ -10,27 +10,33 @@ import (
     "time"
 
     "ves/internal/core/domain"
-    "ves/internal/encryption/chunking"
     "ves/internal/encryption/service"
     "ves/internal/pkg/crypto/aes"
 )
 
-func main() {
-    fmt.Println("VES - Video Encryption Service Test")
-    
-    // Setup directories
-    rawDir := "videos/raw"
-    encDir := "videos/encrypted"
-    decDir := "videos/decrypted"
+// Update paths to use Windows vesplayer directory
+const (
+    // WSL path that maps to D:\Personal\vesplayer\ves-player\ves-videos
+    baseDir           = "/mnt/d/Personal/vesplayer/ves-player/ves-videos"
+    rawVideoDir       = baseDir + "/raw"
+    encryptedVideoDir = baseDir + "/encrypted"
+    decryptedVideoDir = baseDir + "/decrypted"
+    keysDir           = baseDir + "/keys"
+)
 
-    // Create directories if they don't exist
-    for _, dir := range []string{rawDir, encDir, decDir} {
+func init() {
+    // Ensure directories exist
+    dirs := []string{rawVideoDir, encryptedVideoDir, decryptedVideoDir, keysDir}
+    for _, dir := range dirs {
         if err := os.MkdirAll(dir, 0755); err != nil {
-            fmt.Printf("Error creating directory %s: %v\n", dir, err)
-            os.Exit(1)
+            fmt.Printf("Failed to create directory %s: %v\n", dir, err)
         }
     }
+}
 
+func main() {
+    fmt.Println("VES - Video Encryption Service")
+    
     // Show operation menu
     fmt.Println("\nSelect operation:")
     fmt.Println("1. Encrypt video")
@@ -42,9 +48,9 @@ func main() {
 
     switch choice {
     case 1:
-        handleEncryption(rawDir, encDir)
+        handleEncryption(rawVideoDir, encryptedVideoDir)
     case 2:
-        handleDecryption(encDir, decDir)
+        handleDecryption(encryptedVideoDir, decryptedVideoDir)
     default:
         fmt.Println("Invalid choice")
         os.Exit(1)
@@ -107,31 +113,12 @@ func handleEncryption(rawDir, encDir string) {
     }
     defer output.Close()
 
-    // Create chunk reader
-    reader, err := chunking.NewChunkReader(input, chunking.DefaultChunkSize)
-    if err != nil {
-        fmt.Printf("Failed to create chunk reader: %v\n", err)
-        os.Exit(1)
-    }
-
-    // Enable features
-    reader.EnableValidation(true)
-    if err := reader.EnableConcurrency(true, chunking.DefaultWorkers); err != nil {
-        fmt.Printf("Failed to enable concurrency: %v\n", err)
-        os.Exit(1)
-    }
-
     // Create encryption service
     encryptor := aes.NewAESEncryptor(32)  // 32 bytes for AES-256
     encryptionService := service.NewService(encryptor)
 
     fmt.Printf("\nEncrypting %s...\n", filename)
-
-    var key []byte
-    var iv []byte
-
-    // Record start time
-    start := time.Now()
+    startTime := time.Now()
 
     // Create encryption input for the entire file
     encInput := domain.EncryptionInput{
@@ -143,21 +130,17 @@ func handleEncryption(rawDir, encDir string) {
             CreatedAt:   time.Now(),
         },
         Options: domain.EncryptionOptions{
-            ChunkSize: chunking.DefaultChunkSize,
-            KeySize:   32,
+            ChunkSize: 1024 * 1024, // 1MB chunks
+            KeySize:   32,          // AES-256
         },
     }
 
-    // Encrypt the entire file
+    // Encrypt the file
     encOutput, err := encryptionService.Encrypt(context.Background(), encInput)
     if err != nil {
         fmt.Printf("Encryption error: %v\n", err)
         os.Exit(1)
     }
-
-    // Store the key and IV
-    key = encOutput.Key
-    iv = encOutput.IV
 
     // Copy encrypted data to output file
     written, err := io.Copy(output, encOutput.EncryptedReader)
@@ -166,10 +149,9 @@ func handleEncryption(rawDir, encDir string) {
         os.Exit(1)
     }
 
-    duration := time.Since(start)
+    duration := time.Since(startTime)
     fmt.Printf("\nEncryption completed in %v\n", duration)
-    
-    // Show final statistics
+
     fmt.Printf("\nFinal Statistics:\n")
     fmt.Printf("Total Bytes: %d\n", written)
     fmt.Printf("Processing Rate: %.2f MB/s\n", 
@@ -179,11 +161,11 @@ func handleEncryption(rawDir, encDir string) {
     keyPath := outputPath + ".key"
     ivPath := outputPath + ".iv"
     
-    if err := os.WriteFile(keyPath, key, 0600); err != nil {
+    if err := os.WriteFile(keyPath, encOutput.Key, 0600); err != nil {
         fmt.Printf("Error saving encryption key: %v\n", err)
         os.Exit(1)
     }
-    if err := os.WriteFile(ivPath, iv, 0600); err != nil {
+    if err := os.WriteFile(ivPath, encOutput.IV, 0600); err != nil {
         fmt.Printf("Error saving IV: %v\n", err)
         os.Exit(1)
     }
@@ -202,13 +184,13 @@ func handleDecryption(encDir, decDir string) {
     // Filter for .enc files
     var encFiles []os.DirEntry
     for _, f := range files {
-        if filepath.Ext(f.Name()) == ".enc" {
+        if strings.HasSuffix(f.Name(), ".enc") {
             encFiles = append(encFiles, f)
         }
     }
 
     if len(encFiles) == 0 {
-        fmt.Printf("No encrypted files found in %s.\n", encDir)
+        fmt.Printf("No encrypted files found in %s\n", encDir)
         os.Exit(1)
     }
 
@@ -222,7 +204,7 @@ func handleDecryption(encDir, decDir string) {
     var choice int
     fmt.Print("\nSelect file number to decrypt: ")
     fmt.Scanln(&choice)
-    
+
     if choice < 1 || choice > len(encFiles) {
         fmt.Println("Invalid choice")
         os.Exit(1)
@@ -231,16 +213,17 @@ func handleDecryption(encDir, decDir string) {
     filename := encFiles[choice-1].Name()
     inputPath := filepath.Join(encDir, filename)
     outputPath := filepath.Join(decDir, strings.TrimSuffix(filename, ".enc"))
-    keyPath := inputPath + ".key"
 
-    // Read the encryption key and IV
+    // Read key and IV files
+    keyPath := inputPath + ".key"
+    ivPath := inputPath + ".iv"
+
     key, err := os.ReadFile(keyPath)
     if err != nil {
         fmt.Printf("Error reading encryption key: %v\n", err)
         os.Exit(1)
     }
 
-    ivPath := inputPath + ".iv"
     iv, err := os.ReadFile(ivPath)
     if err != nil {
         fmt.Printf("Error reading IV: %v\n", err)
@@ -287,6 +270,6 @@ func handleDecryption(encDir, decDir string) {
     duration := time.Since(start)
     fmt.Printf("\nDecryption completed in %v\n", duration)
     fmt.Printf("Bytes written: %d\n", written)
-    fmt.Printf("Processing Rate: %.2f MB/s\n", 
+    fmt.Printf("Processing Rate: %.2f MB/s\n",
         float64(written)/(1024*1024*duration.Seconds()))
 }
