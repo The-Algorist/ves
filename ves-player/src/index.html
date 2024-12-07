@@ -37,7 +37,11 @@
             border-radius: 4px;
             cursor: pointer;
         }
-        button:hover {
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        button:hover:not(:disabled) {
             background-color: #0056b3;
         }
         .file-info {
@@ -50,11 +54,55 @@
             margin: 5px 0;
             color: #666;
         }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .status.error {
+            display: block;
+            background-color: #ffe6e6;
+            color: #dc3545;
+            border: 1px solid #dc3545;
+        }
+        .status.success {
+            display: block;
+            background-color: #e6ffe6;
+            color: #28a745;
+            border: 1px solid #28a745;
+        }
+        .status.warning {
+            display: block;
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 10px;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>VES Player</h1>
+        <div id="binding-status" class="status">
+            <span id="binding-spinner" class="loading" style="display: none;"></span>
+            <span id="binding-message"></span>
+            <button id="retry-binding" style="display: none; float: right;">Retry Binding</button>
+        </div>
         <div class="controls">
             <button id="select-video">Select Video File</button>
             <button id="select-key">Select Key File</button>

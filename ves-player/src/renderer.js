@@ -1,5 +1,32 @@
 let selectedVideo = null;
 let selectedKey = null;
+let bindingInProgress = false;
+
+// UI Elements
+const bindingStatus = document.getElementById('binding-status');
+const bindingSpinner = document.getElementById('binding-spinner');
+const bindingMessage = document.getElementById('binding-message');
+const retryButton = document.getElementById('retry-binding');
+
+function showBindingStatus(message, type) {
+    bindingStatus.className = 'status ' + type;
+    bindingMessage.textContent = message;
+    bindingStatus.style.display = 'block';
+}
+
+function hideBindingStatus() {
+    bindingStatus.style.display = 'none';
+    bindingSpinner.style.display = 'none';
+    retryButton.style.display = 'none';
+}
+
+function showBindingProgress() {
+    bindingStatus.className = 'status warning';
+    bindingSpinner.style.display = 'inline-block';
+    bindingMessage.textContent = 'Binding device to content...';
+    retryButton.style.display = 'none';
+    bindingStatus.style.display = 'block';
+}
 
 document.getElementById('select-video').addEventListener('click', async () => {
     try {
@@ -11,7 +38,7 @@ document.getElementById('select-video').addEventListener('click', async () => {
         }
     } catch (error) {
         console.error('Error selecting video file:', error);
-        alert('Error selecting video file: ' + error.message);
+        showBindingStatus('Error selecting video file: ' + error.message, 'error');
     }
 });
 
@@ -25,24 +52,35 @@ document.getElementById('select-key').addEventListener('click', async () => {
         }
     } catch (error) {
         console.error('Error selecting key file:', error);
-        alert('Error selecting key file: ' + error.message);
+        showBindingStatus('Error selecting key file: ' + error.message, 'error');
     }
+});
+
+retryButton.addEventListener('click', async () => {
+    hideBindingStatus();
+    await playVideo();
 });
 
 function updatePlayButton() {
     const playButton = document.getElementById('play-video');
-    playButton.disabled = !(selectedVideo && selectedKey);
+    playButton.disabled = !(selectedVideo && selectedKey) || bindingInProgress;
 }
 
-document.getElementById('play-video').addEventListener('click', async () => {
+async function playVideo() {
     if (!selectedVideo || !selectedKey) {
-        alert('Please select both video and key files');
+        showBindingStatus('Please select both video and key files', 'warning');
         return;
     }
+
+    const playButton = document.getElementById('play-video');
+    playButton.disabled = true;
+    bindingInProgress = true;
+    showBindingProgress();
 
     try {
         const decryptedPath = await window.api.decryptVideo(selectedVideo, selectedKey);
         console.log('Decrypted file path:', decryptedPath);
+        hideBindingStatus();
 
         // Create a proper file URL
         const videoUrl = `file://${decryptedPath.replace(/\\/g, '/')}`;
@@ -67,21 +105,20 @@ document.getElementById('play-video').addEventListener('click', async () => {
         // Add new source
         videoPlayer.appendChild(source);
 
-        // Show loading state
-        const playButton = document.getElementById('play-video');
-        playButton.disabled = true;
-        playButton.textContent = 'Decrypting...';
-
         // Set up event handlers before loading
         videoPlayer.onloadeddata = () => {
             console.log('Video loaded successfully');
+            showBindingStatus('Device successfully bound to content', 'success');
+            setTimeout(hideBindingStatus, 3000);
             playButton.textContent = 'Play Video';
             playButton.disabled = false;
+            bindingInProgress = false;
             videoPlayer.play().catch(err => {
                 console.error('Error playing video:', err);
-                alert('Error playing video: ' + err.message);
+                showBindingStatus('Error playing video: ' + err.message, 'error');
                 playButton.textContent = 'Play Video';
                 playButton.disabled = false;
+                bindingInProgress = false;
             });
         };
 
@@ -90,17 +127,27 @@ document.getElementById('play-video').addEventListener('click', async () => {
             console.error('Video error:', error);
             console.error('Error code:', error.code);
             console.error('Error message:', error.message);
-            alert(`Error playing video (${error.code}): ${error.message}`);
+            showBindingStatus(`Error playing video (${error.code}): ${error.message}`, 'error');
+            retryButton.style.display = 'inline-block';
             playButton.textContent = 'Play Video';
             playButton.disabled = false;
+            bindingInProgress = false;
         };
 
         // Now load the video
         videoPlayer.load();
     } catch (error) {
         console.error('Error processing video:', error);
-        alert('Failed to process video: ' + error.message);
+        if (error.message.includes('device binding')) {
+            showBindingStatus('Device binding failed: ' + error.message, 'error');
+            retryButton.style.display = 'inline-block';
+        } else {
+            showBindingStatus('Failed to process video: ' + error.message, 'error');
+        }
         playButton.textContent = 'Play Video';
         playButton.disabled = false;
+        bindingInProgress = false;
     }
-}); 
+}
+
+document.getElementById('play-video').addEventListener('click', playVideo); 

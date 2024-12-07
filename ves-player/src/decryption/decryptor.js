@@ -41,7 +41,6 @@ class VideoDecryptor {
             // Read the key file
             const key = await fs.readFile(keyPath);
             console.log('Read key:', key.length, 'bytes');
-            console.log('Key (hex):', key.toString('hex'));
 
             // Read metadata size from last 4 bytes
             const metadataSize = this.readUInt32BE(encryptedData, encryptedData.length - 4);
@@ -68,7 +67,7 @@ class VideoDecryptor {
 
                 console.log(`Processing chunk - IV size: ${ivSize}, Encrypted size: ${encryptedSize}`);
 
-                // Read IV (nonce)
+                // Read IV (nonce) - it's appended to the header
                 const iv = encryptedData.slice(position, position + ivSize);
                 position += ivSize;
 
@@ -80,19 +79,24 @@ class VideoDecryptor {
                 const authTag = encryptedChunk.slice(-16);
                 const ciphertext = encryptedChunk.slice(0, -16);
 
-                // Create decipher
-                const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-                decipher.setAuthTag(authTag);
+                try {
+                    // Create decipher
+                    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+                    decipher.setAuthTag(authTag);
 
-                // Decrypt
-                const decrypted = Buffer.concat([
-                    decipher.update(ciphertext),
-                    decipher.final()
-                ]);
+                    // Decrypt
+                    const decrypted = Buffer.concat([
+                        decipher.update(ciphertext),
+                        decipher.final()
+                    ]);
 
-                // Write decrypted chunk
-                writeStream.write(decrypted);
-                console.log(`Processed chunk of ${decrypted.length} bytes`);
+                    // Write decrypted chunk
+                    writeStream.write(decrypted);
+                    console.log(`Processed chunk of ${decrypted.length} bytes`);
+                } catch (error) {
+                    console.error('Chunk decryption error:', error);
+                    throw new Error('Failed to decrypt chunk: ' + error.message);
+                }
             }
 
             // Close the write stream
@@ -114,4 +118,4 @@ class VideoDecryptor {
     }
 }
 
-module.exports = VideoDecryptor; 
+module.exports = VideoDecryptor;
