@@ -1,14 +1,50 @@
-videos/*
-
+# AWS credentials
+.aws/
+*.pem
 *.key
-*.iv    
-node_modules/*
 
-*.mp4
-*.mp3
-*.wav
+# Environment variables
+.env
+*.env
 
-*.enc
-*.key
-*.iv
+# Build artifacts
+bin/
+*.exe
+*.test
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+
+# Test files
 coverage.out
+*.test
+*.tmp
+
+# Encrypted videos
+*.enc
+encrypted/
+
+# Temporary files
+tmp/
+temp/
+
+# Node modules (for Electron player)
+node_modules/
+dist/
+
+# Go files
+vendor/
+
+# Sensitive files
+*.env
+*.pem
+*.key
+
+test.mp4
+
+# Test files
+test.mp4
+
+videos/*
