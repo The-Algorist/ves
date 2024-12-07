@@ -8,6 +8,7 @@ import (
     "path/filepath"
     "strings"
     "time"
+    "bytes"
 
     "ves/internal/core/domain"
     "ves/internal/encryption/service"
@@ -157,20 +158,13 @@ func handleEncryption(rawDir, encDir string) {
     fmt.Printf("Processing Rate: %.2f MB/s\n", 
         float64(written)/(1024*1024*duration.Seconds()))
 
-    // Save the key and IV for decryption
+    // Save the key
     keyPath := outputPath + ".key"
-    ivPath := outputPath + ".iv"
-    
     if err := os.WriteFile(keyPath, encOutput.Key, 0600); err != nil {
         fmt.Printf("Error saving encryption key: %v\n", err)
         os.Exit(1)
     }
-    if err := os.WriteFile(ivPath, encOutput.IV, 0600); err != nil {
-        fmt.Printf("Error saving IV: %v\n", err)
-        os.Exit(1)
-    }
     fmt.Printf("\nEncryption key saved to: %s\n", keyPath)
-    fmt.Printf("IV saved to: %s\n", ivPath)
 }
 
 func handleDecryption(encDir, decDir string) {
@@ -214,19 +208,11 @@ func handleDecryption(encDir, decDir string) {
     inputPath := filepath.Join(encDir, filename)
     outputPath := filepath.Join(decDir, strings.TrimSuffix(filename, ".enc"))
 
-    // Read key and IV files
+    // Read key file
     keyPath := inputPath + ".key"
-    ivPath := inputPath + ".iv"
-
     key, err := os.ReadFile(keyPath)
     if err != nil {
         fmt.Printf("Error reading encryption key: %v\n", err)
-        os.Exit(1)
-    }
-
-    iv, err := os.ReadFile(ivPath)
-    if err != nil {
-        fmt.Printf("Error reading IV: %v\n", err)
         os.Exit(1)
     }
 
@@ -253,8 +239,15 @@ func handleDecryption(encDir, decDir string) {
     fmt.Printf("\nDecrypting %s...\n", filename)
     start := time.Now()
 
+    // Read all encrypted data
+    encryptedData, err := io.ReadAll(input)
+    if err != nil {
+        fmt.Printf("Error reading encrypted file: %v\n", err)
+        os.Exit(1)
+    }
+
     // Decrypt the file
-    decryptedReader, err := encryptionService.Decrypt(context.Background(), input, key, iv)
+    decryptedReader, err := encryptionService.Decrypt(context.Background(), bytes.NewReader(encryptedData), key, nil)
     if err != nil {
         fmt.Printf("Decryption error: %v\n", err)
         os.Exit(1)
