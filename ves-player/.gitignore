@@ -2,3 +2,9 @@ node_modules/*
 
 *.key
 *.iv
+
+test.mp4
+
+videos/*
+
+test/*
